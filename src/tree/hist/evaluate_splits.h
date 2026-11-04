@@ -1,385 +1,543 @@
-/*!
- * Copyright 2021 by XGBoost Contributors
+/**
+ * Copyright 2021-2026, XGBoost Contributors
  */
 #ifndef XGBOOST_TREE_HIST_EVALUATE_SPLITS_H_
 #define XGBOOST_TREE_HIST_EVALUATE_SPLITS_H_
 
-#include <algorithm>
-#include <memory>
-#include <numeric>
-#include <limits>
-#include <utility>
-#include <vector>
+#include <algorithm>  // for copy
+#include <array>      // for array
+#include <cstddef>    // for size_t
+#include <limits>     // for numeric_limits
+#include <memory>     // for shared_ptr
+#include <numeric>    // for iota
+#include <utility>    // for move
+#include <vector>     // for vector
 
-#include "xgboost/task.h"
-#include "../param.h"
-#include "../constraints.h"
-#include "../split_evaluator.h"
-#include "../../common/categorical.h"
-#include "../../common/random.h"
-#include "../../common/hist_util.h"
-#include "../../data/gradient_index.h"
+#include "../../common/categorical.h"  // for CatBitField
+#include "../../common/common.h"       // for DivRoundUp
+#include "../../common/hist_util.h"    // for GHistRow, HistogramCuts
+#include "../../common/linalg_op.h"    // for cbegin, cend, begin
+#include "../../common/random.h"       // for ColumnSampler
+#include "../constraints.h"            // for FeatureInteractionConstraintHost
+#include "../param.h"                  // for TrainParam
+#include "../split_evaluator.h"        // for TreeEvaluator
+#include "expand_entry.h"              // for CPUExpandEntry
+#include "hist_cache.h"                // for BoundedHistCollection
+#include "xgboost/base.h"              // for bst_node_t, bst_target_t, bst_feature_t
+#include "xgboost/context.h"           // for Context
+#include "xgboost/linalg.h"            // for Constants, Vector
+#include "xgboost/tree_model.h"        // for RegTree
 
-namespace xgboost {
-namespace tree {
+namespace xgboost::tree {
+/** @brief CPU histogram split evaluation for scalar and vector tree candidates. */
+class HistEvaluator {
+  using SplitEntryT = decltype(CPUExpandEntry{}.split);
 
-template <typename GradientSumT, typename ExpandEntry> class HistEvaluator {
- private:
-  struct NodeEntry {
-    /*! \brief statics for node entry */
-    GradStats stats;
-    /*! \brief loss of this node, without split */
-    bst_float root_gain{0.0f};
-  };
-
- private:
-  TrainParam param_;
-  std::shared_ptr<common::ColumnSampler> column_sampler_;
+  std::vector<double> gain_;
+  linalg::Matrix<GradientPairPrecise> stats_;
+  TrainParam const *param_;
   TreeEvaluator tree_evaluator_;
-  int32_t n_threads_ {0};
   FeatureInteractionConstraintHost interaction_constraints_;
-  std::vector<NodeEntry> snode_;
-  ObjInfo task_;
+  std::shared_ptr<common::ColumnSampler> column_sampler_;
+  Context const *ctx_;
 
-  // if sum of statistics for non-missing values in the node
-  // is equal to sum of statistics for all values:
-  // then - there are no missing values
-  // else - there are missing values
-  bool static SplitContainsMissingValues(const GradStats e, const NodeEntry &snode) {
-    if (e.GetGrad() == snode.stats.GetGrad() &&
-        e.GetHess() == snode.stats.GetHess()) {
-      return false;
-    } else {
-      return true;
-    }
-  }
-  enum SplitType { kNum = 0, kOneHot = 1, kPart = 2 };
-
+ private:
   // Enumerate/Scan the split values of specific feature
-  // Returns the sum of gradients corresponding to the data points that contains
-  // a non-missing value for the particular feature fid.
-  template <int d_step, SplitType split_type>
-  GradStats EnumerateSplit(common::HistogramCuts const &cut, common::Span<size_t const> sorted_idx,
-                           const common::GHistRow<GradientSumT> &hist, bst_feature_t fidx,
-                           bst_node_t nidx,
-                           TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator,
-                           SplitEntry *p_best) const {
+  template <bst_bin_t d_step, bool kSingleTarget>
+  bool EnumerateSplitImpl(common::HistogramCuts const &cut, bst_feature_t fidx,
+                          common::Span<common::ConstGHistRow> hist,
+                          linalg::VectorView<GradientPairPrecise const> parent_sum,
+                          double parent_gain, bst_node_t nidx,
+                          TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator,
+                          SplitEntryT *p_best) const {
     static_assert(d_step == +1 || d_step == -1, "Invalid step.");
+    auto const &cut_ptr = cut.Ptrs();
+    auto const &cut_val = cut.Values();
+    CHECK_LE(cut_ptr[fidx], static_cast<uint32_t>(std::numeric_limits<bst_bin_t>::max()));
+    CHECK_LE(cut_ptr[fidx + 1], static_cast<uint32_t>(std::numeric_limits<bst_bin_t>::max()));
 
-    // aliases
-    const std::vector<uint32_t> &cut_ptr = cut.Ptrs();
-    const std::vector<bst_float> &cut_val = cut.Values();
-    auto const &parent = snode_[nidx];
-    int32_t n_bins{static_cast<int32_t>(cut_ptr.at(fidx + 1) - cut_ptr[fidx])};
-    auto f_hist = hist.subspan(cut_ptr[fidx], n_bins);
-
-    // statistics on both sides of split
-    GradStats left_sum;
-    GradStats right_sum;
-    // best split so far
-    SplitEntry best;
-
-    // bin boundaries
-    CHECK_LE(cut_ptr[fidx], static_cast<uint32_t>(std::numeric_limits<int32_t>::max()));
-    CHECK_LE(cut_ptr[fidx + 1], static_cast<uint32_t>(std::numeric_limits<int32_t>::max()));
-    // imin: index (offset) of the minimum value for feature fid need this for backward
-    //       enumeration
-    const auto imin = static_cast<int32_t>(cut_ptr[fidx]);
-    // ibegin, iend: smallest/largest cut points for feature fid use int to allow for
-    // value -1
-    int32_t ibegin, iend;
-    if (d_step > 0) {
-      ibegin = static_cast<int32_t>(cut_ptr[fidx]);
-      iend = static_cast<int32_t>(cut_ptr.at(fidx + 1));
-    } else {
-      ibegin = static_cast<int32_t>(cut_ptr[fidx + 1]) - 1;
-      iend = static_cast<int32_t>(cut_ptr[fidx]) - 1;
-    }
-
-    auto calc_bin_value = [&](auto i) {
-      switch (split_type) {
-        case kNum: {
-          left_sum.Add(hist[i].GetGrad(), hist[i].GetHess());
-          right_sum.SetSubstract(parent.stats, left_sum);
-          break;
+    auto scan = [&](auto &sums) {
+      // Construct views here to keep the one-target extent visible to the compiler.
+      auto [left_sum, right_sum] = [&] {
+        if constexpr (kSingleTarget) {
+          return std::make_pair(linalg::MakeVec(sums.data(), 1),
+                                linalg::MakeVec(sums.data() + 1, 1));
+        } else {
+          return std::make_pair(sums.Slice(0, linalg::All()), sums.Slice(1, linalg::All()));
         }
-        case kOneHot: {
-          // not-chosen categories go to left
-          right_sum = GradStats{hist[i]};
-          left_sum.SetSubstract(parent.stats, right_sum);
-          break;
-        }
-        case kPart: {
-          auto j = d_step == 1 ? (i - ibegin) : (ibegin - i);
-          right_sum.Add(f_hist[sorted_idx[j]].GetGrad(), f_hist[sorted_idx[j]].GetHess());
-          left_sum.SetSubstract(parent.stats, right_sum);
-          break;
-        }
-        default: {
-          std::terminate();
-        }
+      }();
+      auto n_split_targets = kSingleTarget ? 1 : hist.size();
+      // ibegin, iend: smallest/largest cut points for feature fid use int to allow for
+      // value -1
+      bst_bin_t ibegin, iend;
+      if (d_step > 0) {
+        ibegin = static_cast<bst_bin_t>(cut_ptr[fidx]);
+        iend = static_cast<bst_bin_t>(cut_ptr[fidx + 1]);
+      } else {
+        ibegin = static_cast<bst_bin_t>(cut_ptr[fidx + 1]) - 1;
+        iend = static_cast<bst_bin_t>(cut_ptr[fidx]) - 1;
       }
-    };
+      for (bst_bin_t i = ibegin; i != iend; i += d_step) {
+        for (bst_target_t t = 0; t < n_split_targets; ++t) {
+          auto t_hist = hist[t];
+          auto t_p = parent_sum(t);
+          left_sum(t) += t_hist[i];
+          right_sum(t) = t_p - left_sum(t);
+        }
 
-    int32_t best_thresh{-1};
-    for (int32_t i = ibegin; i != iend; i += d_step) {
-      // start working
-      // try to find a split
-      calc_bin_value(i);
-      bool improved{false};
-      if (left_sum.GetHess() >= param_.min_child_weight &&
-          right_sum.GetHess() >= param_.min_child_weight) {
-        bst_float loss_chg;
-        bst_float split_pt;
         if (d_step > 0) {
           // forward enumeration: split at right bound of each bin
-          loss_chg =
-              static_cast<float>(evaluator.CalcSplitGain(param_, nidx, fidx, GradStats{left_sum},
-                                                         GradStats{right_sum}) -
-                                 parent.root_gain);
-          split_pt = cut_val[i];
-          improved = best.Update(loss_chg, fidx, split_pt, d_step == -1, split_type != kNum,
-                                 left_sum, right_sum);
+          auto split_pt = cut_val[i];
+          auto loss_chg =
+              evaluator.CalcSplitGain(*param_, nidx, fidx, left_sum, right_sum) - parent_gain;
+          p_best->Update(loss_chg, fidx, split_pt, d_step == -1, false, left_sum, right_sum);
         } else {
           // backward enumeration: split at left bound of each bin
-          loss_chg =
-              static_cast<float>(evaluator.CalcSplitGain(param_, nidx, fidx, GradStats{right_sum},
-                                                         GradStats{left_sum}) -
-                                 parent.root_gain);
-          switch (split_type) {
-            case kNum: {
-              if (i == imin) {
-                split_pt = cut.MinValues()[fidx];
-              } else {
-                split_pt = cut_val[i - 1];
-              }
-              break;
-            }
-            case kOneHot: {
-              split_pt = cut_val[i];
-              break;
-            }
-            case kPart: {
-              split_pt = cut_val[i];
-              break;
-            }
+          auto split_pt = common::HistogramCuts::NumericBinLowerBound(cut_ptr, cut_val, fidx, i);
+          auto loss_chg =
+              evaluator.CalcSplitGain(*param_, nidx, fidx, right_sum, left_sum) - parent_gain;
+          p_best->Update(loss_chg, fidx, split_pt, d_step == -1, false, right_sum, left_sum);
+        }
+      }
+      if (!p_best->is_cat) {
+        p_best->cat_bits.clear();
+      }
+      // if sum of statistics for non-missing values in the node
+      // is equal to sum of statistics for all values:
+      // then - there are no missing values
+      // else - there are missing values
+      // return true if there's missing. Doesn't handle floating-point error well.
+      if (d_step == +1) {
+        return !std::equal(linalg::cbegin(left_sum), linalg::cend(left_sum),
+                           linalg::cbegin(parent_sum));
+      }
+      return false;
+    };
+
+    if constexpr (kSingleTarget) {
+      std::array<GradientPairPrecise, 2> sums{};
+      return scan(sums);
+    } else {
+      // Keep hot writes off cache lines shared with neighboring allocations, which can hold
+      // another worker's candidate gradients. Pad both ends so alignment and target count
+      // don't affect isolation.
+      constexpr std::size_t kCacheLine = 64;
+      auto const kPadding = common::DivRoundUp(kCacheLine, sizeof(GradientPairPrecise));
+      std::vector<GradientPairPrecise> storage(2 * hist.size() + 2 * kPadding);
+      auto sums = linalg::MakeTensorView(
+          ctx_, common::Span<GradientPairPrecise>{storage.data() + kPadding, 2 * hist.size()}, 2,
+          hist.size());
+      return scan(sums);
+    }
+  }
+
+  /**
+   * \brief Use learned direction with one-hot split. Other implementations (LGB) create a
+   *        pseudo-category for missing value but here we just do a complete scan to avoid
+   *        making specialized histogram bin.
+   */
+  template <bool kSingleTarget>
+  void EnumerateOneHot(common::HistogramCuts const &cut, bst_feature_t fidx,
+                       common::Span<common::ConstGHistRow> hist,
+                       linalg::VectorView<GradientPairPrecise const> parent_sum, double parent_gain,
+                       bst_node_t nidx, TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator,
+                       SplitEntryT *p_best) const {
+    auto const &cut_ptr = cut.Ptrs();
+    auto const &cut_val = cut.Values();
+
+    bst_bin_t ibegin = static_cast<bst_bin_t>(cut_ptr[fidx]);
+    bst_bin_t iend = static_cast<bst_bin_t>(cut_ptr[fidx + 1]);
+    bst_bin_t n_bins = iend - ibegin;
+    auto n_split_targets = kSingleTarget ? 1 : hist.size();
+
+    std::array<GradientPairPrecise, 3> single_sum{};
+    // Isolate heap scratch from other workers' candidate buffers.
+    auto const padding = common::DivRoundUp(std::size_t{64}, sizeof(GradientPairPrecise));
+    std::vector<GradientPairPrecise> sum(kSingleTarget ? 0 : 3 * n_split_targets + 2 * padding);
+    auto *data = kSingleTarget ? single_sum.data() : sum.data() + padding;
+    auto left_sum = linalg::MakeVec(data, n_split_targets);
+    auto right_sum = linalg::MakeVec(data + n_split_targets, n_split_targets);
+
+    // Per-target missing gradient: parent_sum - sum_of_all_bins.
+    auto missing = linalg::MakeVec(data + 2 * n_split_targets, n_split_targets);
+    for (bst_target_t t = 0; t < n_split_targets; ++t) {
+      auto f_hist = hist[t].subspan(cut_ptr[fidx], n_bins);
+      GradientPairPrecise feature_sum{};
+      for (bst_bin_t b = 0; b < n_bins; ++b) {
+        feature_sum += f_hist[b];
+      }
+      missing(t) = parent_sum(t) - feature_sum;
+    }
+
+    bool updated = false;
+
+    for (bst_bin_t i = ibegin; i != iend; ++i) {
+      auto split_pt = cut_val[i];
+
+      // Evaluate missing values with the other categories, then with this category.
+      for (bool default_left : {true, false}) {
+        for (bst_target_t t = 0; t < n_split_targets; ++t) {
+          right_sum(t) = hist[t][i];
+          if (!default_left) {
+            right_sum(t) += missing(t);
           }
-          improved = best.Update(loss_chg, fidx, split_pt, d_step == -1, split_type != kNum,
-                                 right_sum, left_sum);
+          left_sum(t) = parent_sum(t) - right_sum(t);
         }
-        if (improved) {
-          best_thresh = i;
+        auto gain = evaluator.CalcSplitGain(*param_, nidx, fidx, left_sum, right_sum) - parent_gain;
+        if (p_best->Update(gain, fidx, split_pt, default_left, true, left_sum, right_sum)) {
+          updated = true;
         }
       }
     }
 
-    if (split_type == kPart && best_thresh != -1) {
-      auto n = common::CatBitField::ComputeStorageSize(n_bins);
-      best.cat_bits.resize(n, 0);
-      common::CatBitField cat_bits{best.cat_bits};
+    if (updated) {
+      auto n = common::CatBitField::ComputeStorageSize(n_bins + 1);
+      p_best->cat_bits.assign(n, 0);
+      common::CatBitField cat_bits{p_best->cat_bits};
+      cat_bits.Set(p_best->split_value);
+    }
+  }
 
-      if (d_step == 1) {
-        std::for_each(sorted_idx.begin(), sorted_idx.begin() + (best_thresh - ibegin + 1),
-                      [&cat_bits](size_t c) { cat_bits.Set(c); });
-      } else {
-        std::for_each(sorted_idx.rbegin(), sorted_idx.rbegin() + (ibegin - best_thresh),
-                      [&cat_bits](size_t c) { cat_bits.Set(c); });
+  /**
+   * @brief Enumerate with partition-based splits.
+   *
+   * The implementation is different from LightGBM. Firstly we don't have a
+   * pseudo-cateogry for missing value, instead of we make 2 complete scans over the
+   * histogram. Secondly, both scan directions generate splits in the same
+   * order. Following table depicts the scan process, square bracket means the gradient in
+   * missing values is resided on that partition:
+   *
+   *   | Forward  | Backward |
+   *   |----------+----------|
+   *   | [BCDE] A | E [ABCD] |
+   *   | [CDE] AB | DE [ABC] |
+   *   | [DE] ABC | CDE [AB] |
+   *   | [E] ABCD | BCDE [A] |
+   */
+  template <bst_bin_t d_step, bool kSingleTarget>
+  void EnumeratePart(common::HistogramCuts const &cut, common::Span<size_t const> sorted_idx,
+                     common::Span<common::ConstGHistRow> hist, bst_feature_t fidx,
+                     linalg::VectorView<GradientPairPrecise const> parent_sum, double parent_gain,
+                     bst_node_t nidx, TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator,
+                     SplitEntryT *p_best) const {
+    static_assert(d_step == +1 || d_step == -1, "Invalid step.");
+    auto n_split_targets = kSingleTarget ? 1 : hist.size();
+
+    auto const &cut_ptr = cut.Ptrs();
+    auto const &cut_val = cut.Values();
+
+    bst_bin_t f_begin = cut_ptr[fidx];
+    bst_bin_t f_end = cut_ptr[fidx + 1];
+    bst_bin_t n_bins_feature{f_end - f_begin};
+    auto n_bins = std::min(param_->max_cat_threshold, n_bins_feature);
+
+    bst_bin_t it_begin, it_end;
+    if (d_step > 0) {
+      it_begin = f_begin;
+      it_end = it_begin + n_bins - 1;
+    } else {
+      it_begin = f_end - 1;
+      it_end = it_begin - n_bins + 1;
+    }
+
+    std::array<GradientPairPrecise, 2> single_sum{};
+    // Isolate heap scratch from other workers' candidate buffers.
+    auto const padding = common::DivRoundUp(std::size_t{64}, sizeof(GradientPairPrecise));
+    std::vector<GradientPairPrecise> sum(kSingleTarget ? 0 : 2 * n_split_targets + 2 * padding);
+    auto *data = kSingleTarget ? single_sum.data() : sum.data() + padding;
+    auto left_sum = linalg::MakeVec(data, n_split_targets);
+    auto right_sum = linalg::MakeVec(data + n_split_targets, n_split_targets);
+
+    bst_bin_t best_thresh{-1};
+    for (bst_bin_t i = it_begin; i != it_end; i += d_step) {
+      auto j = i - f_begin;  // index local to current feature
+      for (bst_target_t t = 0; t < n_split_targets; ++t) {
+        auto f_hist = hist[t].subspan(f_begin, n_bins_feature);
+        if (d_step == 1) {
+          right_sum(t) += f_hist[sorted_idx[j]];
+          left_sum(t) = parent_sum(t) - right_sum(t);  // missing on left
+        } else {
+          left_sum(t) += f_hist[sorted_idx[j]];
+          right_sum(t) = parent_sum(t) - left_sum(t);  // missing on right
+        }
+      }
+
+      auto loss_chg =
+          evaluator.CalcSplitGain(*param_, nidx, fidx, left_sum, right_sum) - parent_gain;
+      // We don't have a numeric split point, nan here is a dummy split.
+      if (p_best->Update(loss_chg, fidx, std::numeric_limits<float>::quiet_NaN(), d_step == 1, true,
+                         left_sum, right_sum)) {
+        best_thresh = i;
       }
     }
-    p_best->Update(best);
 
-    switch (split_type) {
-      case kNum:
-        // Normal, accumulated to left
-        return left_sum;
-      case kOneHot:
-        // Doesn't matter, not accumulating.
-        return {};
-      case kPart:
-        // Accumulated to right due to chosen cats go to right.
-        return right_sum;
+    if (best_thresh != -1) {
+      auto n = common::CatBitField::ComputeStorageSize(n_bins_feature);
+      p_best->cat_bits.assign(n, 0);
+      common::CatBitField cat_bits{p_best->cat_bits};
+      bst_bin_t partition = d_step == 1 ? (best_thresh - it_begin + 1) : (best_thresh - f_begin);
+      CHECK_GT(partition, 0);
+      std::for_each(sorted_idx.begin(), sorted_idx.begin() + partition, [&](std::size_t c) {
+        auto cat = cut_val[c + f_begin];
+        cat_bits.Set(cat);
+      });
     }
-    return left_sum;
   }
 
  public:
-  void EvaluateSplits(const common::HistCollection<GradientSumT> &hist,
+  void EvaluateSplits(BoundedHistCollection const &hist, common::HistogramCuts const &cut,
+                      common::Span<FeatureType const> feature_types,
+                      std::vector<CPUExpandEntry> *entries) {
+    BoundedHistCollection const *hist_ptr = &hist;
+    this->EvaluateSplits({&hist_ptr, 1}, cut, feature_types, entries);
+  }
+
+  void EvaluateSplits(common::Span<const BoundedHistCollection *> hist,
                       common::HistogramCuts const &cut,
                       common::Span<FeatureType const> feature_types,
-                      const RegTree &tree,
-                      std::vector<ExpandEntry> *p_entries) {
-    auto& entries = *p_entries;
-    // All nodes are on the same level, so we can store the shared ptr.
-    std::vector<std::shared_ptr<HostDeviceVector<bst_feature_t>>> features(
-        entries.size());
-    for (size_t nidx_in_set = 0; nidx_in_set < entries.size(); ++nidx_in_set) {
-      auto nidx = entries[nidx_in_set].nid;
-      features[nidx_in_set] =
-          column_sampler_->GetFeatureSet(tree.GetDepth(nidx));
+                      std::vector<CPUExpandEntry> *p_entries) {
+    if (hist.size() == 1) {
+      this->EvaluateSplitsImpl<true>(hist, cut, feature_types, p_entries);
+    } else {
+      this->EvaluateSplitsImpl<false>(hist, cut, feature_types, p_entries);
+    }
+  }
+
+ private:
+  template <bool kSingleTarget>
+  void EvaluateSplitsImpl(common::Span<const BoundedHistCollection *> hist,
+                          common::HistogramCuts const &cut,
+                          common::Span<FeatureType const> feature_types,
+                          std::vector<CPUExpandEntry> *p_entries) {
+    auto &entries = *p_entries;
+    CHECK_EQ(stats_.Shape(1), hist.size());
+    CHECK(!hist.empty());
+    std::vector<std::shared_ptr<HostDeviceVector<bst_feature_t>>> features(entries.size());
+
+    for (std::size_t nidx_in_set = 0; nidx_in_set < entries.size(); ++nidx_in_set) {
+      features[nidx_in_set] = column_sampler_->GetFeatureSet(ctx_, entries[nidx_in_set].depth);
     }
     CHECK(!features.empty());
-    const size_t grain_size =
-        std::max<size_t>(1, features.front()->Size() / n_threads_);
-    common::BlockedSpace2d space(entries.size(), [&](size_t nidx_in_set) {
-      return features[nidx_in_set]->Size();
-    }, grain_size);
 
-    std::vector<ExpandEntry> tloc_candidates(n_threads_ * entries.size());
-    for (size_t i = 0; i < entries.size(); ++i) {
-      for (decltype(n_threads_) j = 0; j < n_threads_; ++j) {
-        tloc_candidates[i * n_threads_ + j] = entries[i];
+    std::int32_t n_threads = ctx_->Threads();
+    std::size_t const grain_size = std::max<std::size_t>(1, features.front()->Size() / n_threads);
+    common::BlockedSpace2d space{
+        entries.size(), [&](std::size_t nidx_in_set) { return features[nidx_in_set]->Size(); },
+        grain_size};
+
+    std::vector<CPUExpandEntry> tloc_candidates(n_threads * entries.size());
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+      for (std::int32_t j = 0; j < n_threads; ++j) {
+        tloc_candidates[i * n_threads + j] = entries[i];
       }
     }
-    auto evaluator = tree_evaluator_.GetEvaluator();
 
-    common::ParallelFor2d(space, n_threads_, [&](size_t nidx_in_set, common::Range1d r) {
-      auto tidx = omp_get_thread_num();
-      auto entry = &tloc_candidates[n_threads_ * nidx_in_set + tidx];
-      auto best = &entry->split;
-      auto nidx = entry->nid;
-      auto histogram = hist[nidx];
-      auto features_set = features[nidx_in_set]->ConstHostSpan();
-      for (auto fidx_in_set = r.begin(); fidx_in_set < r.end(); fidx_in_set++) {
-        auto fidx = features_set[fidx_in_set];
-        bool is_cat = common::IsCat(feature_types, fidx);
-        if (!interaction_constraints_.Query(nidx, fidx)) {
-          continue;
-        }
-        if (is_cat) {
-          auto n_bins = cut.Ptrs().at(fidx + 1) - cut.Ptrs()[fidx];
-          if (common::UseOneHot(n_bins, param_.max_cat_to_onehot, task_)) {
-            EnumerateSplit<+1, kOneHot>(cut, {}, histogram, fidx, nidx, evaluator, best);
-            EnumerateSplit<-1, kOneHot>(cut, {}, histogram, fidx, nidx, evaluator, best);
-          } else {
-            auto const &cut_ptr = cut.Ptrs();
-            std::vector<size_t> sorted_idx(n_bins);
-            std::iota(sorted_idx.begin(), sorted_idx.end(), 0);
-            auto feat_hist = histogram.subspan(cut_ptr[fidx], n_bins);
-            std::stable_sort(sorted_idx.begin(), sorted_idx.end(), [&](size_t l, size_t r) {
-              auto ret = evaluator.CalcWeightCat(param_, feat_hist[l]) <
-                         evaluator.CalcWeightCat(param_, feat_hist[r]);
-              static_assert(std::is_same<decltype(ret), bool>::value, "");
-              return ret;
-            });
-            auto grad_stats =
-                EnumerateSplit<+1, kPart>(cut, sorted_idx, histogram, fidx, nidx, evaluator, best);
-            if (SplitContainsMissingValues(grad_stats, snode_[nidx])) {
-              EnumerateSplit<-1, kPart>(cut, sorted_idx, histogram, fidx, nidx, evaluator, best);
+    auto evaluator = tree_evaluator_.GetEvaluator();
+    common::ParallelFor2d(
+        space, n_threads,
+        common::WithWorker([&](std::size_t nidx_in_set, common::Range1d r, common::Worker worker) {
+          auto tidx = worker.Id();
+          auto entry = &tloc_candidates[n_threads * nidx_in_set + tidx];
+          auto best = &entry->split;
+
+          auto parent_sum = stats_.Slice(entry->nid, linalg::All());
+          auto n_split_targets = kSingleTarget ? 1 : hist.size();
+          std::array<common::ConstGHistRow, 1> single_hist;
+          std::vector<common::ConstGHistRow> multi_hist(n_split_targets == 1 ? 0 : n_split_targets);
+          common::Span<common::ConstGHistRow> node_hist{
+              n_split_targets == 1 ? single_hist.data() : multi_hist.data(), n_split_targets};
+          for (std::size_t t = 0; t < n_split_targets; ++t) {
+            node_hist[t] = (*hist[t])[entry->nid];
+          }
+          auto features_set = features[nidx_in_set]->ConstHostSpan();
+          // Multi-target categories are sorted by their projection onto the parent weight.
+          std::vector<float> parent_weight(n_split_targets == 1 ? 0 : n_split_targets);
+          for (std::size_t t = 0; t < parent_weight.size(); ++t) {
+            parent_weight[t] = evaluator.CalcWeightCat(parent_sum(t));
+          }
+
+          for (auto fidx_in_set = r.begin(); fidx_in_set < r.end(); fidx_in_set++) {
+            auto fidx = features_set[fidx_in_set];
+            if (!interaction_constraints_.Query(entry->nid, fidx)) {
+              continue;
             }
-          }
-        } else {
-          auto grad_stats =
-              EnumerateSplit<+1, kNum>(cut, {}, histogram, fidx, nidx, evaluator, best);
-          if (SplitContainsMissingValues(grad_stats, snode_[nidx])) {
-            EnumerateSplit<-1, kNum>(cut, {}, histogram, fidx, nidx, evaluator, best);
-          }
-        }
-      }
-    });
+            auto parent_gain = gain_[entry->nid];
+            bool is_cat = common::IsCat(feature_types, fidx);
+            // Numeric split
+            if (!is_cat) {
+              bool missing = this->EnumerateSplitImpl<+1, kSingleTarget>(
+                  cut, fidx, node_hist, parent_sum, parent_gain, entry->nid, evaluator, best);
+              if (missing) {
+                this->EnumerateSplitImpl<-1, kSingleTarget>(
+                    cut, fidx, node_hist, parent_sum, parent_gain, entry->nid, evaluator, best);
+              }
+              continue;
+            }
 
-    for (unsigned nidx_in_set = 0; nidx_in_set < entries.size();
-         ++nidx_in_set) {
-      for (auto tidx = 0; tidx < n_threads_; ++tidx) {
-        entries[nidx_in_set].split.Update(
-            tloc_candidates[n_threads_ * nidx_in_set + tidx].split);
+            auto const &cut_ptr = cut.Ptrs();
+            auto n_bins = cut_ptr.at(fidx + 1) - cut_ptr[fidx];
+            // One hot split
+            if (common::UseOneHot(n_bins, param_->max_cat_to_onehot)) {
+              this->EnumerateOneHot<kSingleTarget>(cut, fidx, node_hist, parent_sum, parent_gain,
+                                                   entry->nid, evaluator, best);
+              continue;
+            }
+
+            // Partition split
+            std::vector<double> scores(n_bins);
+            for (std::size_t bin_idx = 0; bin_idx < n_bins; ++bin_idx) {
+              auto bin = cut_ptr[fidx] + bin_idx;
+              if (n_split_targets == 1) {
+                scores[bin_idx] = evaluator.CalcWeightCat(node_hist[0][bin]);
+                continue;
+              }
+              // s_c = w_p^T w_c. Since we care only about the ordering, no need to divide the norm.
+              double sc = 0.0;
+              for (std::size_t t = 0; t < n_split_targets; ++t) {
+                sc += parent_weight[t] * evaluator.CalcWeightCat(node_hist[t][bin]);
+              }
+              scores[bin_idx] = sc;
+            }
+
+            std::vector<size_t> sorted_idx(n_bins);
+            std::iota(sorted_idx.begin(), sorted_idx.end(), 0ul);
+            std::stable_sort(sorted_idx.begin(), sorted_idx.end(),
+                             [&](std::size_t l, std::size_t r) { return scores[l] < scores[r]; });
+
+            this->EnumeratePart<+1, kSingleTarget>(cut, sorted_idx, node_hist, fidx, parent_sum,
+                                                   parent_gain, entry->nid, evaluator, best);
+            this->EnumeratePart<-1, kSingleTarget>(cut, sorted_idx, node_hist, fidx, parent_sum,
+                                                   parent_gain, entry->nid, evaluator, best);
+          }
+        }));
+
+    for (std::size_t nidx_in_set = 0; nidx_in_set < entries.size(); ++nidx_in_set) {
+      for (auto tidx = 0; tidx < n_threads; ++tidx) {
+        entries[nidx_in_set].split.Update(tloc_candidates[n_threads * nidx_in_set + tidx].split);
       }
     }
   }
-  // Add splits to tree, handles all statistic
-  void ApplyTreeSplit(ExpandEntry const& candidate, RegTree *p_tree) {
+
+ public:
+  float InitRoot(GradStats const &root_sum) {
+    GradientPairPrecise sum{root_sum.GetGrad(), root_sum.GetHess()};
+    auto weight = this->InitRoot(linalg::MakeVec(&sum, 1));
+    return weight(0);
+  }
+
+  linalg::Vector<float> InitRoot(linalg::VectorView<GradientPairPrecise const> root_sum) {
+    auto n_split_targets = root_sum.Size();
+    stats_ = linalg::Constant(ctx_, GradientPairPrecise{}, 1, n_split_targets);
+    gain_.resize(1);
+
+    linalg::Vector<float> weight({n_split_targets}, ctx_->Device());
     auto evaluator = tree_evaluator_.GetEvaluator();
-    RegTree &tree = *p_tree;
+    evaluator.CalcWeight(RegTree::kRoot, *param_, root_sum, weight.HostView());
+    gain_.front() = evaluator.CalcGain(RegTree::kRoot, *param_, root_sum);
 
-    GradStats parent_sum = candidate.split.left_sum;
-    parent_sum.Add(candidate.split.right_sum);
-    auto base_weight =
-        evaluator.CalcWeight(candidate.nid, param_, GradStats{parent_sum});
+    auto h_stats = stats_.HostView();
+    std::copy(linalg::cbegin(root_sum), linalg::cend(root_sum), linalg::begin(h_stats));
 
-    auto left_weight = evaluator.CalcWeight(
-        candidate.nid, param_, GradStats{candidate.split.left_sum});
-    auto right_weight = evaluator.CalcWeight(
-        candidate.nid, param_, GradStats{candidate.split.right_sum});
-
-    if (candidate.split.is_cat) {
-      std::vector<uint32_t> split_cats;
-      if (candidate.split.cat_bits.empty()) {
-        CHECK_LT(candidate.split.split_value, std::numeric_limits<bst_cat_t>::max())
-            << "Categorical feature value too large.";
-        auto cat = common::AsCat(candidate.split.split_value);
-        split_cats.resize(LBitField32::ComputeStorageSize(std::max(cat + 1, 1)), 0);
-        LBitField32 cat_bits;
-        cat_bits = LBitField32(split_cats);
-        cat_bits.Set(cat);
-      } else {
-        split_cats = candidate.split.cat_bits;
-      }
-
-      tree.ExpandCategorical(
-          candidate.nid, candidate.split.SplitIndex(), split_cats, candidate.split.DefaultLeft(),
-          base_weight, left_weight, right_weight, candidate.split.loss_chg, parent_sum.GetHess(),
-          candidate.split.left_sum.GetHess(), candidate.split.right_sum.GetHess());
-    } else {
-      tree.ExpandNode(candidate.nid, candidate.split.SplitIndex(), candidate.split.split_value,
-                      candidate.split.DefaultLeft(), base_weight,
-                      left_weight * param_.learning_rate, right_weight * param_.learning_rate,
-                      candidate.split.loss_chg, parent_sum.GetHess(),
-                      candidate.split.left_sum.GetHess(), candidate.split.right_sum.GetHess());
-    }
-
-    // Set up child constraints
-    auto left_child = tree[candidate.nid].LeftChild();
-    auto right_child = tree[candidate.nid].RightChild();
-    tree_evaluator_.AddSplit(candidate.nid, left_child, right_child,
-                             tree[candidate.nid].SplitIndex(), left_weight,
-                             right_weight);
-
-    auto max_node = std::max(left_child, tree[candidate.nid].RightChild());
-    max_node = std::max(candidate.nid, max_node);
-    snode_.resize(tree.GetNodes().size());
-    snode_.at(left_child).stats = candidate.split.left_sum;
-    snode_.at(left_child).root_gain = evaluator.CalcGain(
-        candidate.nid, param_, GradStats{candidate.split.left_sum});
-    snode_.at(right_child).stats = candidate.split.right_sum;
-    snode_.at(right_child).root_gain = evaluator.CalcGain(
-        candidate.nid, param_, GradStats{candidate.split.right_sum});
-
-    interaction_constraints_.Split(candidate.nid,
-                                   tree[candidate.nid].SplitIndex(), left_child,
-                                   right_child);
-  }
-
-  auto Evaluator() const { return tree_evaluator_.GetEvaluator(); }
-  auto const& Stats() const { return snode_; }
-
-  float InitRoot(GradStats const& root_sum) {
-    snode_.resize(1);
-    auto root_evaluator = tree_evaluator_.GetEvaluator();
-
-    snode_[0].stats = GradStats{root_sum.GetGrad(), root_sum.GetHess()};
-    snode_[0].root_gain = root_evaluator.CalcGain(RegTree::kRoot, param_,
-                                                  GradStats{snode_[0].stats});
-    auto weight = root_evaluator.CalcWeight(RegTree::kRoot, param_,
-                                            GradStats{snode_[0].stats});
     return weight;
   }
 
- public:
+  // Add splits to tree, handles all statistic
+  void ApplyTreeSplit(CPUExpandEntry const &candidate, RegTree *p_tree) {
+    // Use the split gradient's number of targets for intermediate weights
+    // This may differ from p_tree->NumTargets() when using reduced gradient
+    auto left_sum =
+        linalg::MakeVec(candidate.split.left_sum.data(), candidate.split.left_sum.size());
+    auto right_sum =
+        linalg::MakeVec(candidate.split.right_sum.data(), candidate.split.right_sum.size());
+    auto n_split_targets = left_sum.Size();
+    auto parent_sum = stats_.Slice(candidate.nid, linalg::All());
+
+    auto evaluator = tree_evaluator_.GetEvaluator();
+    std::vector<float> weight(3 * n_split_targets);
+    auto base_weight = linalg::MakeVec(weight.data(), n_split_targets);
+    auto left_weight = linalg::MakeVec(weight.data() + n_split_targets, n_split_targets);
+    auto right_weight = linalg::MakeVec(weight.data() + 2 * n_split_targets, n_split_targets);
+    evaluator.CalcWeight(candidate.nid, *param_, parent_sum, base_weight);
+    evaluator.CalcSplitWeights(*param_, candidate.nid, candidate.split.SplitIndex(), left_sum,
+                               right_sum, left_weight, right_weight);
+
+    // Compute the loss_chg and sum hessians for parent and children
+    float loss_chg = candidate.split.loss_chg;
+    // Sum hessians across all targets for each child
+    double left_sum_hess = 0.0, right_sum_hess = 0.0;
+    for (std::size_t t = 0; t < n_split_targets; ++t) {
+      left_sum_hess += left_sum(t).GetHess();
+      right_sum_hess += right_sum(t).GetHess();
+    }
+
+    common::Span<CatWordT const> cat_bits;
+    if (candidate.split.is_cat) {
+      cat_bits = candidate.split.cat_bits;
+    }
+    SplitInfo split{candidate.nid, candidate.split.SplitIndex(), candidate.split.split_value,
+                    candidate.split.DefaultLeft(), cat_bits};
+    if (!p_tree->IsMultiTarget()) {
+      CHECK_EQ(n_split_targets, 1);
+      p_tree->Expand({split,
+                      {base_weight(0), left_sum_hess + right_sum_hess},
+                      {left_weight(0), left_sum_hess},
+                      {right_weight(0), right_sum_hess},
+                      loss_chg});
+    } else {
+      p_tree->Expand(ctx_, ExpandBatch{{split,
+                                        {base_weight.Values(), left_sum_hess + right_sum_hess},
+                                        {left_weight.Values(), left_sum_hess},
+                                        {right_weight.Values(), right_sum_hess},
+                                        loss_chg}});
+    }
+    auto left_child = p_tree->LeftChild(candidate.nid);
+    CHECK_GT(left_child, candidate.nid);
+    auto right_child = p_tree->RightChild(candidate.nid);
+    CHECK_GT(right_child, candidate.nid);
+
+    // Set up child constraints
+    tree_evaluator_.AddSplit(candidate.nid, left_child, right_child, candidate.split.SplitIndex(),
+                             left_weight, right_weight);
+    evaluator = tree_evaluator_.GetEvaluator();
+    interaction_constraints_.Split(candidate.nid, candidate.split.SplitIndex(), left_child,
+                                   right_child);
+
+    std::size_t n_nodes = p_tree->Size();
+    gain_.resize(n_nodes);
+    gain_[left_child] = evaluator.CalcGain(left_child, *param_, left_sum);
+    gain_[right_child] = evaluator.CalcGain(right_child, *param_, right_sum);
+
+    if (n_nodes >= stats_.Shape(0)) {
+      stats_.Reshape(n_nodes * 2, stats_.Shape(1));
+    }
+    CHECK_EQ(stats_.Shape(1), n_split_targets);
+    auto left_sum_stat = stats_.Slice(left_child, linalg::All());
+    std::copy(linalg::cbegin(left_sum), linalg::cend(left_sum), linalg::begin(left_sum_stat));
+    auto right_sum_stat = stats_.Slice(right_child, linalg::All());
+    std::copy(linalg::cbegin(right_sum), linalg::cend(right_sum), linalg::begin(right_sum_stat));
+  }
+
   // The column sampler must be constructed by caller since we need to preserve the rng
   // for the entire training session.
-  explicit HistEvaluator(TrainParam const &param, MetaInfo const &info, int32_t n_threads,
-                         std::shared_ptr<common::ColumnSampler> sampler, ObjInfo task,
-                         bool skip_0_index = false)
+  explicit HistEvaluator(Context const *ctx, TrainParam const *param, MetaInfo const &info,
+                         std::shared_ptr<common::ColumnSampler> sampler)
+      : HistEvaluator{ctx, info, param, static_cast<bst_target_t>(1), std::move(sampler)} {}
+
+  explicit HistEvaluator(Context const *ctx, MetaInfo const &info, TrainParam const *param,
+                         bst_target_t n_split_targets,
+                         std::shared_ptr<common::ColumnSampler> sampler)
       : param_{param},
+        tree_evaluator_{*param, static_cast<bst_feature_t>(info.num_col_), DeviceOrd::CPU(),
+                        n_split_targets},
         column_sampler_{std::move(sampler)},
-        tree_evaluator_{param, static_cast<bst_feature_t>(info.num_col_), GenericParameter::kCpuId},
-        n_threads_{n_threads},
-        task_{task} {
-    interaction_constraints_.Configure(param, info.num_col_);
-    column_sampler_->Init(info.num_col_, info.feature_weigths.HostVector(),
-                          param_.colsample_bynode, param_.colsample_bylevel,
-                          param_.colsample_bytree, skip_0_index);
+        ctx_{ctx} {
+    interaction_constraints_.Configure(*param, info.num_col_);
+    column_sampler_->Init(ctx, info.num_col_, info.feature_weights, param_->colsample_bynode,
+                          param_->colsample_bylevel, param_->colsample_bytree);
   }
+
+  [[nodiscard]] auto Evaluator() const { return tree_evaluator_.GetEvaluator(); }
 };
-}      // namespace tree
-}      // namespace xgboost
+
+}  // namespace xgboost::tree
 #endif  // XGBOOST_TREE_HIST_EVALUATE_SPLITS_H_

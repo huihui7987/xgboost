@@ -1,246 +1,344 @@
+/**
+ * Copyright 2021-2026, XGBoost Contributors
+ */
+#include "../test_evaluate_splits.h"
+
 #include <gtest/gtest.h>
-#include <xgboost/base.h>
-#include "../../../../src/tree/hist/evaluate_splits.h"
-#include "../../../../src/tree/updater_quantile_hist.h"
-#include "../../../../src/common/hist_util.h"
-#include "../../helpers.h"
+#include <xgboost/base.h>        // for Args, GradientPairPrecise
+#include <xgboost/context.h>     // for Context
+#include <xgboost/data.h>        // for FeatureType, MetaInfo
+#include <xgboost/tree_model.h>  // for RegTree
 
-namespace xgboost {
-namespace tree {
-template <typename GradientSumT> void TestEvaluateSplits() {
-  int static constexpr kRows = 8, kCols = 16;
-  auto orig = omp_get_max_threads();
-  int32_t n_threads = std::min(omp_get_max_threads(), 4);
-  omp_set_num_threads(n_threads);
-  auto sampler = std::make_shared<common::ColumnSampler>();
+#include <initializer_list>  // for initializer_list
+#include <memory>            // for make_shared, make_unique
+#include <numeric>           // for accumulate, iota
+#include <string>            // for to_string
+#include <tuple>             // for make_tuple
 
-  TrainParam param;
-  param.UpdateAllowUnknown(Args{{"min_child_weight", "0"}, {"reg_lambda", "0"}});
+#include "../../../../src/common/random.h"              // for ColumnSampler
+#include "../../../../src/tree/hist/evaluate_splits.h"  // for HistEvaluator
+#include "../../../../src/tree/hist/hist_param.h"       // for HistMakerTrainParam
+#include "../../../../src/tree/tree_view.h"             // for ScalarTreeView
+#include "../../helpers.h"  // for SimpleLCG, SimpleRealUniformDistribution
 
-  auto dmat = RandomDataGenerator(kRows, kCols, 0).Seed(3).GenerateDMatrix();
+namespace xgboost::tree {
+void TestPartitionBasedSplit::SetUp() {
+  param_.UpdateAllowUnknown(
+      Args{{"min_child_weight", "0"}, {"reg_lambda", "0"}, {"max_cat_to_onehot", "1"}});
+  sorted_idx_.resize(n_bins_);
+  std::iota(sorted_idx_.begin(), sorted_idx_.end(), 0);
 
-  auto evaluator = HistEvaluator<GradientSumT, CPUExpandEntry>{
-      param, dmat->Info(), n_threads, sampler, ObjInfo{ObjInfo::kRegression}};
-  common::HistCollection<GradientSumT> hist;
-  std::vector<GradientPair> row_gpairs = {
-      {1.23f, 0.24f}, {0.24f, 0.25f}, {0.26f, 0.27f},  {2.27f, 0.28f},
-      {0.27f, 0.29f}, {0.37f, 0.39f}, {-0.47f, 0.49f}, {0.57f, 0.59f}};
+  info_.num_col_ = 1;
+  cuts_ = common::HistogramCuts{1};
 
-  size_t constexpr kMaxBins = 4;
-  // dense, no missing values
+  cuts_.SetCategorical(true, n_bins_);
+  auto &h_cuts = cuts_.cut_ptrs_.HostVector();
+  h_cuts[0] = 0;
+  h_cuts[1] = n_bins_;
+  auto &h_vals = cuts_.cut_values_.HostVector();
+  h_vals.resize(n_bins_);
+  std::iota(h_vals.begin(), h_vals.end(), 0.0);
 
-  GHistIndexMatrix gmat(dmat.get(), kMaxBins);
-  common::RowSetCollection row_set_collection;
-  std::vector<size_t> &row_indices = *row_set_collection.Data();
-  row_indices.resize(kRows);
-  std::iota(row_indices.begin(), row_indices.end(), 0);
-  row_set_collection.Init();
+  Context ctx;
+  HistMakerTrainParam hist_param;
+  hist_.Reset(cuts_.TotalBins(), hist_param.MaxCachedHistNodes(ctx.Device()));
+  hist_.AllocateHistograms({0});
+  auto node_hist = hist_[0];
 
-  auto hist_builder = GHistBuilder<GradientSumT>(omp_get_max_threads(), gmat.cut.Ptrs().back());
-  hist.Init(gmat.cut.Ptrs().back());
-  hist.AddHistRow(0);
-  hist.AllocateAllData();
-  hist_builder.template BuildHist<false>(row_gpairs, row_set_collection[0],
-                                         gmat, hist[0]);
+  SimpleLCG lcg;
+  SimpleRealUniformDistribution<double> grad_dist{-4.0, 4.0};
+  SimpleRealUniformDistribution<double> hess_dist{0.0, 4.0};
 
-  // Compute total gradient for all data points
-  GradientPairPrecise total_gpair;
-  for (const auto &e : row_gpairs) {
-    total_gpair += GradientPairPrecise(e);
+  for (auto &e : node_hist) {
+    e = GradientPairPrecise{grad_dist(&lcg), hess_dist(&lcg)};
+    total_gpair_ += e;
   }
 
-  RegTree tree;
+  auto enumerate = [this, n_feat = info_.num_col_](common::GHistRow hist,
+                                                   GradientPairPrecise parent_sum) {
+    int32_t best_thresh = -1;
+    float best_score{-std::numeric_limits<float>::infinity()};
+    TreeEvaluator evaluator{param_, static_cast<bst_feature_t>(n_feat), DeviceOrd::CPU(), 1u};
+    auto tree_evaluator = evaluator.GetEvaluator();
+    GradientPairPrecise left_sum;
+    auto parent_gain = tree_evaluator.CalcGain(0, param_, GradStats{total_gpair_});
+    for (size_t i = 0; i < hist.size() - 1; ++i) {
+      left_sum += hist[i];
+      auto right_sum = parent_sum - left_sum;
+      auto gain =
+          tree_evaluator.CalcSplitGain(param_, 0, 0, GradStats{left_sum}, GradStats{right_sum}) -
+          parent_gain;
+      if (gain > best_score) {
+        best_score = gain;
+        best_thresh = i;
+      }
+    }
+    return std::make_tuple(best_thresh, best_score);
+  };
+
+  // enumerate all possible partitions to find the optimal split
+  do {
+    std::vector<GradientPairPrecise> sorted_hist(node_hist.size());
+    for (size_t i = 0; i < sorted_hist.size(); ++i) {
+      sorted_hist[i] = node_hist[sorted_idx_[i]];
+    }
+    auto [thresh, score] = enumerate({sorted_hist}, total_gpair_);
+    if (score > best_score_) {
+      best_score_ = score;
+    }
+  } while (std::next_permutation(sorted_idx_.begin(), sorted_idx_.end()));
+}
+
+TEST_F(TestPartitionBasedSplit, CPUHist) {
+  Context ctx;
+  // check the evaluator is returning the optimal split
+  std::vector<FeatureType> ft{FeatureType::kCategorical};
+  auto sampler = std::make_shared<common::ColumnSampler>();
+  HistEvaluator evaluator{&ctx, &param_, info_, sampler};
+  evaluator.InitRoot(GradStats{total_gpair_});
   std::vector<CPUExpandEntry> entries(1);
-  entries.front().nid = 0;
-  entries.front().depth = 0;
+  evaluator.EvaluateSplits(hist_, cuts_, {ft}, &entries);
+  ASSERT_FLOAT_EQ(entries[0].split.loss_chg, best_score_);
+}
 
-  evaluator.InitRoot(GradStats{total_gpair});
-  evaluator.EvaluateSplits(hist, gmat.cut, {}, tree, &entries);
+template <bst_target_t split_targets, bst_target_t targets = split_targets>
+struct EvaluatorTestCase {
+  static constexpr bst_target_t kSplitTargets = split_targets;
+  static constexpr bst_target_t kTargets = targets;
+};
 
-  auto best_loss_chg =
-      evaluator.Evaluator().CalcSplitGain(
-          param, 0, entries.front().split.SplitIndex(),
-          entries.front().split.left_sum, entries.front().split.right_sum) -
-      evaluator.Stats().front().root_gain;
-  ASSERT_EQ(entries.front().split.loss_chg, best_loss_chg);
-  ASSERT_GT(entries.front().split.loss_chg, 16.2f);
+template <typename TestCase>
+class TestHistEvaluator : public ::testing::Test {
+ protected:
+  static constexpr auto kSplitTargets = TestCase::kSplitTargets;
+  static constexpr auto kTargets = TestCase::kTargets;
+  static constexpr bool kScalarTree = kTargets == 1;
+  Context ctx_;
+  TrainParam param_;
+  common::HistogramCuts cuts_ = MakeCutsForTest({0.0, 1.0, 2.0}, {0, 3}, DeviceOrd::CPU());
+  std::vector<FeatureType> ft_{FeatureType::kCategorical};
+  std::unique_ptr<HistEvaluator> evaluator_;
+  std::vector<CPUExpandEntry> entries_;
+  linalg::Vector<float> weight_{{kSplitTargets}, DeviceOrd::CPU()};
+  float root_hess_{0.0f};
 
-  // Assert that's the best split
-  for (size_t i = 1; i < gmat.cut.Ptrs().size(); ++i) {
-    GradStats left, right;
-    for (size_t j = gmat.cut.Ptrs()[i-1]; j < gmat.cut.Ptrs()[i]; ++j) {
-      auto loss_chg =
-          evaluator.Evaluator().CalcSplitGain(param, 0, i - 1, left, right) -
-          evaluator.Stats().front().root_gain;
-      ASSERT_GE(best_loss_chg, loss_chg);
-      left.Add(hist[0][j].GetGrad(), hist[0][j].GetHess());
-      right.SetSubstract(GradStats{total_gpair}, left);
+  // A single histogram/missing sum is repeated across targets; otherwise use each target's data.
+  // hist_data is target-major
+  auto const &Evaluate(std::vector<std::vector<GradientPairPrecise>> const &hist_data,
+                       std::vector<GradientPairPrecise> const &missing = {}, Args args = {}) {
+    param_.UpdateAllowUnknown(Args{{"min_child_weight", "0"},
+                                   {"reg_lambda", "0"},
+                                   {"reg_alpha", "0"},
+                                   {"max_delta_step", "0"},
+                                   {"max_cat_to_onehot", "1"},
+                                   {"max_cat_threshold", "64"}});
+    param_.UpdateAllowUnknown(args);
+    MetaInfo info;
+    info.num_col_ = ft_.size();
+    auto sampler = std::make_shared<common::ColumnSampler>();
+    evaluator_ = std::make_unique<HistEvaluator>(&ctx_, info, &param_, kSplitTargets, sampler);
+    std::vector<BoundedHistCollection> hist(kSplitTargets);
+    std::vector<BoundedHistCollection const *> ptrs;
+    linalg::Vector<GradientPairPrecise> parent({kSplitTargets}, ctx_.Device());
+    root_hess_ = 0.0f;
+    for (bst_target_t t = 0; t < kSplitTargets; ++t) {
+      auto const &bins = hist_data.at(hist_data.size() == 1 ? 0 : t);
+      CHECK_EQ(bins.size(), cuts_.TotalBins());
+      hist[t].Reset(cuts_.TotalBins(), 2);
+      hist[t].AllocateHistograms({0});
+      std::copy(bins.begin(), bins.end(), hist[t][0].begin());
+      ptrs.push_back(&hist[t]);
+      auto sum = missing.empty() ? GradientPairPrecise{} : missing.at(missing.size() == 1 ? 0 : t);
+      parent(t) = std::accumulate(bins.begin(), bins.begin() + cuts_.Ptrs()[1], sum);
+      root_hess_ += parent(t).GetHess();
+    }
+    entries_.assign(1, CPUExpandEntry{0, 0});
+    weight_ = evaluator_->InitRoot(parent.HostView());
+    for (bst_target_t t = 0; t < kSplitTargets; ++t) {
+      EXPECT_FLOAT_EQ(weight_(t), CalcWeight(param_, parent(t)));
+    }
+    evaluator_->EvaluateSplits(ptrs, cuts_, ft_, &entries_);
+    EXPECT_EQ(sampler->GetFeatureSet(&ctx_, 0)->Size(), ft_.size());
+    return entries_.front().split;
+  }
+
+  void CheckCategories(std::initializer_list<bool> expected) {
+    auto const &split = entries_.front().split;
+    ASSERT_TRUE(split.is_cat);
+    common::KCatBitField bits{split.cat_bits};
+    bst_cat_t cat = 0;
+    for (bool selected : expected) {
+      EXPECT_EQ(bits.Check(cat++), selected);
     }
   }
 
-  omp_set_num_threads(orig);
-}
-
-TEST(HistEvaluator, Evaluate) {
-  TestEvaluateSplits<float>();
-  TestEvaluateSplits<double>();
-}
-
-TEST(HistEvaluator, Apply) {
-  RegTree tree;
-  int static constexpr kNRows = 8, kNCols = 16;
-  TrainParam param;
-  param.UpdateAllowUnknown(Args{{}});
-  auto dmat = RandomDataGenerator(kNRows, kNCols, 0).Seed(3).GenerateDMatrix();
-  auto sampler = std::make_shared<common::ColumnSampler>();
-  auto evaluator_ = HistEvaluator<float, CPUExpandEntry>{param, dmat->Info(), 4, sampler,
-                                                         ObjInfo{ObjInfo::kRegression}};
-
-  CPUExpandEntry entry{0, 0, 10.0f};
-  entry.split.left_sum = GradStats{0.4, 0.6f};
-  entry.split.right_sum = GradStats{0.5, 0.7f};
-
-  evaluator_.ApplyTreeSplit(entry, &tree);
-  ASSERT_EQ(tree.NumExtraNodes(), 2);
-  ASSERT_EQ(tree.Stat(tree[0].LeftChild()).sum_hess, 0.6f);
-  ASSERT_EQ(tree.Stat(tree[0].RightChild()).sum_hess, 0.7f);
-}
-
-TEST(HistEvaluator, CategoricalPartition) {
-  int static constexpr kRows = 128, kCols = 1;
-  using GradientSumT = double;
-  std::vector<FeatureType> ft(kCols, FeatureType::kCategorical);
-
-  TrainParam param;
-  param.UpdateAllowUnknown(Args{{"min_child_weight", "0"}, {"reg_lambda", "0"}});
-
-  size_t n_cats{8};
-
-  auto dmat =
-      RandomDataGenerator(kRows, kCols, 0).Seed(3).Type(ft).MaxCategory(n_cats).GenerateDMatrix();
-
-  int32_t n_threads = 16;
-  auto sampler = std::make_shared<common::ColumnSampler>();
-  auto evaluator = HistEvaluator<GradientSumT, CPUExpandEntry>{
-      param, dmat->Info(), n_threads, sampler, ObjInfo{ObjInfo::kRegression}};
-
-  for (auto const &gmat : dmat->GetBatches<GHistIndexMatrix>({GenericParameter::kCpuId, 32})) {
-    common::HistCollection<GradientSumT> hist;
-
-    std::vector<CPUExpandEntry> entries(1);
-    entries.front().nid = 0;
-    entries.front().depth = 0;
-
-    hist.Init(gmat.cut.TotalBins());
-    hist.AddHistRow(0);
-    hist.AllocateAllData();
-    auto node_hist = hist[0];
-    ASSERT_EQ(node_hist.size(), n_cats);
-    ASSERT_EQ(node_hist.size(), gmat.cut.Ptrs().back());
-
-    GradientPairPrecise total_gpair;
-    for (size_t i = 0; i < node_hist.size(); ++i) {
-      node_hist[i] = {static_cast<double>(node_hist.size() - i), 1.0};
-      total_gpair += node_hist[i];
+  void CheckApply() {
+    RegTree tree{kTargets, static_cast<bst_feature_t>(ft_.size())};
+    if constexpr (kScalarTree) {
+      tree.SetRoot(weight_(0), root_hess_);
+    } else {
+      tree.SetRoot(weight_.HostView(), root_hess_);
     }
-    SimpleLCG lcg;
-    std::shuffle(node_hist.begin(), node_hist.end(), lcg);
-
-    RegTree tree;
-    evaluator.InitRoot(GradStats{total_gpair});
-    evaluator.EvaluateSplits(hist, gmat.cut, ft, tree, &entries);
-    ASSERT_TRUE(entries.front().split.is_cat);
-
-    auto run_eval = [&](auto fn) {
-      for (size_t i = 1; i < gmat.cut.Ptrs().size(); ++i) {
-        GradStats left, right;
-        for (size_t j = gmat.cut.Ptrs()[i - 1]; j < gmat.cut.Ptrs()[i]; ++j) {
-          auto loss_chg = evaluator.Evaluator().CalcSplitGain(param, 0, i - 1, left, right) -
-                          evaluator.Stats().front().root_gain;
-          fn(loss_chg);
-          left.Add(node_hist[j].GetGrad(), node_hist[j].GetHess());
-          right.SetSubstract(GradStats{total_gpair}, left);
+    evaluator_->ApplyTreeSplit(entries_.front(), &tree);
+    EXPECT_EQ(tree.NumTargets(), kTargets);
+    if constexpr (!kScalarTree) {
+      EXPECT_EQ(tree.GetMultiTargetTree()->NumSplitTargets(), kSplitTargets);
+    }
+    // Projected leaves are finalized by the updater using full gradients.
+    if constexpr (kSplitTargets == kTargets) {
+      tree.FinalizeLeaves(param_.learning_rate);
+    }
+    auto view = [&] {
+      if constexpr (kScalarTree) {
+        return ScalarTreeView{&tree};
+      } else {
+        return tree.HostMtView();
+      }
+    }();
+    // Check that the resulting tree is consistent with the generated split entry.
+    auto const &split = entries_.front().split;
+    ASSERT_EQ(view.Size(), 3);
+    EXPECT_EQ(view.SplitIndex(0), split.SplitIndex());
+    EXPECT_EQ(view.DefaultLeft(0), split.DefaultLeft());
+    EXPECT_EQ(view.SplitType(0),
+              split.is_cat ? FeatureType::kCategorical : FeatureType::kNumerical);
+    EXPECT_EQ(view.NodeCats(0).size(), split.cat_bits.size());
+    for (auto child : {view.LeftChild(0), view.RightChild(0)}) {
+      auto const &sum = child == view.LeftChild(0) ? split.left_sum : split.right_sum;
+      double hess = 0.0;
+      for (bst_target_t t = 0; t < kSplitTargets; ++t) {
+        auto stats = sum.at(t);
+        hess += stats.GetHess();
+        if constexpr (kSplitTargets == kTargets) {
+          auto weight = [&] {
+            if constexpr (kScalarTree) {
+              return view.LeafValue(child);
+            } else {
+              return view.LeafValue(child)(t);
+            }
+          }();
+          EXPECT_NEAR(weight, CalcWeight(param_, stats) * param_.learning_rate, kRtEps);
         }
       }
-    };
-    // Assert that's the best split
-    auto best_loss_chg = entries.front().split.loss_chg;
-    run_eval([&](auto loss_chg) {
-      // Approximated test that gain returned by optimal partition is greater than
-      // numerical split.
-      ASSERT_GT(best_loss_chg, loss_chg);
-    });
-    // node_hist is captured in lambda.
-    std::sort(node_hist.begin(), node_hist.end(), [&](auto l, auto r) {
-      return evaluator.Evaluator().CalcWeightCat(param, l) <
-             evaluator.Evaluator().CalcWeightCat(param, r);
-    });
-
-    double reimpl = 0;
-    run_eval([&](auto loss_chg) { reimpl = std::max(loss_chg, reimpl); });
-    CHECK_EQ(reimpl, best_loss_chg);
-  }
-}
-
-namespace {
-auto CompareOneHotAndPartition(bool onehot) {
-  int static constexpr kRows = 128, kCols = 1;
-  using GradientSumT = double;
-  std::vector<FeatureType> ft(kCols, FeatureType::kCategorical);
-
-  TrainParam param;
-  if (onehot) {
-    // force use one-hot
-    param.UpdateAllowUnknown(
-        Args{{"min_child_weight", "0"}, {"reg_lambda", "0"}, {"max_cat_to_onehot", "100"}});
-  } else {
-    param.UpdateAllowUnknown(
-        Args{{"min_child_weight", "0"}, {"reg_lambda", "0"}, {"max_cat_to_onehot", "1"}});
-  }
-
-  size_t n_cats{2};
-
-  auto dmat =
-      RandomDataGenerator(kRows, kCols, 0).Seed(3).Type(ft).MaxCategory(n_cats).GenerateDMatrix();
-
-  int32_t n_threads = 16;
-  auto sampler = std::make_shared<common::ColumnSampler>();
-  auto evaluator = HistEvaluator<GradientSumT, CPUExpandEntry>{
-      param, dmat->Info(), n_threads, sampler, ObjInfo{ObjInfo::kRegression}};
-  std::vector<CPUExpandEntry> entries(1);
-
-  for (auto const &gmat : dmat->GetBatches<GHistIndexMatrix>({GenericParameter::kCpuId, 32})) {
-    common::HistCollection<GradientSumT> hist;
-
-    entries.front().nid = 0;
-    entries.front().depth = 0;
-
-    hist.Init(gmat.cut.TotalBins());
-    hist.AddHistRow(0);
-    hist.AllocateAllData();
-    auto node_hist = hist[0];
-
-    CHECK_EQ(node_hist.size(), n_cats);
-    CHECK_EQ(node_hist.size(), gmat.cut.Ptrs().back());
-
-    GradientPairPrecise total_gpair;
-    for (size_t i = 0; i < node_hist.size(); ++i) {
-      node_hist[i] = {static_cast<double>(node_hist.size() - i), 1.0};
-      total_gpair += node_hist[i];
+      EXPECT_FLOAT_EQ(view.SumHess(child), hess);
     }
-    RegTree tree;
-    evaluator.InitRoot(GradStats{total_gpair});
-    evaluator.EvaluateSplits(hist, gmat.cut, ft, tree, &entries);
   }
-  return entries.front();
-}
-}  // anonymous namespace
+};
 
-TEST(HistEvaluator, Categorical) {
-  auto with_onehot = CompareOneHotAndPartition(true);
-  auto with_part = CompareOneHotAndPartition(false);
+using HistEvaluatorCases =
+    ::testing::Types<EvaluatorTestCase<1>,
+                     EvaluatorTestCase<1, 2>,  // one projected gradient, two outputs
+                     EvaluatorTestCase<2>>;
+TYPED_TEST_SUITE(TestHistEvaluator, HistEvaluatorCases);
 
-  ASSERT_EQ(with_onehot.split.loss_chg, with_part.split.loss_chg);
+TYPED_TEST(TestHistEvaluator, Numeric) {
+  for (auto threads : {1, 4}) {
+    this->ctx_.nthread = threads;
+    this->ft_ = {FeatureType::kNumerical, FeatureType::kNumerical};
+    this->cuts_ = MakeCutsForTest({0.5, 1.0, 2.0, 3.0}, {0, 2, 4}, DeviceOrd::CPU());
+    auto const &split = this->Evaluate({{{-0.5, 0.5}, {2.0, 0.5}, {0.5, 0.5}, {1.0, 0.5}}});
+    EXPECT_FLOAT_EQ(split.loss_chg, 6.25f * this->kSplitTargets);
+    EXPECT_EQ(split.SplitIndex(), 0);
+    EXPECT_EQ(split.split_value, 0.5f);
+    this->CheckApply();
+
+    this->ft_.resize(1);
+    this->cuts_ = MakeCutsForTest({0.0, 1.0, 2.0}, {0, 3}, DeviceOrd::CPU());
+    for (auto missing : {-3.0, 3.0}) {
+      auto const &split = this->Evaluate({{{-2.0, 1.0}, {0.0, 1.0}, {2.0, 1.0}}}, {{missing, 1.0}});
+      EXPECT_FLOAT_EQ(split.loss_chg, 12.25f * this->kSplitTargets);
+      EXPECT_EQ(split.DefaultLeft(), missing < 0.0);
+      EXPECT_FALSE(split.is_cat);
+      EXPECT_EQ(split.split_value, missing < 0.0 ? 0.0f : 1.0f);
+      for (bst_target_t t = 0; t < this->kSplitTargets; ++t) {
+        EXPECT_EQ(split.left_sum.at(t), GradientPairPrecise(missing < 0.0 ? -5.0 : -2.0, 2.0));
+        EXPECT_EQ(split.right_sum.at(t), GradientPairPrecise(missing < 0.0 ? 2.0 : 5.0, 2.0));
+      }
+    }
+  }
 }
-}  // namespace tree
-}  // namespace xgboost
+
+TYPED_TEST(TestHistEvaluator, OneHot) {
+  for (auto missing : {-3.0, 3.0}) {
+    auto const &split = this->Evaluate({{{1.0, 1.0}, {-2.0, 1.0}, {1.0, 1.0}}}, {{missing, 1.0}},
+                                       {{"max_cat_to_onehot", "4"}});
+    // Isolate category 1, grouping the missing gradient with the same sign.
+    EXPECT_FLOAT_EQ(split.loss_chg, (missing < 0.0 ? 12.25f : 10.083333f) * this->kSplitTargets);
+    EXPECT_EQ(split.DefaultLeft(), missing > 0.0);
+    this->CheckCategories({false, true, false});
+  }
+  auto const &split = this->Evaluate(
+      {{{1.0, 0.5}, {-0.5, 0.5}, {0.5, 0.5}}, {{0.5, 0.5}, {1.0, 0.5}, {-0.5, 0.5}}}, {},
+      {{"max_cat_to_onehot", "4"},
+       {"reg_alpha", "0.1"},
+       {"reg_lambda", "1"},
+       {"max_delta_step", "0.25"}});
+  EXPECT_NEAR(split.loss_chg, this->kSplitTargets == 1 ? 0.3875f : 0.45f, kRtEps);
+  EXPECT_EQ(split.split_value, 1.0f);
+  this->CheckCategories({false, true, false});
+  this->CheckApply();
+
+  // For two categories, one-hot and partition scans find the same split gain.
+  this->cuts_ = MakeCutsForTest({0.0, 1.0}, {0, 2}, DeviceOrd::CPU());
+  auto onehot = this->Evaluate({{{2.0, 1.0}, {1.0, 1.0}}}, {}, {{"max_cat_to_onehot", "4"}});
+  auto const &partition = this->Evaluate({{{2.0, 1.0}, {1.0, 1.0}}});
+  EXPECT_EQ(onehot.loss_chg, partition.loss_chg);
+}
+
+TYPED_TEST(TestHistEvaluator, PartitionMissing) {
+  this->cuts_ = MakeCutsForTest({0.0, 1.0, 2.0, 3.0}, {0, 4}, DeviceOrd::CPU());
+  auto const &split =
+      this->Evaluate({{{0.5, 0.5}, {0.5, 0.5}, {1.0, 1.0}, {1.0, 1.0}}}, {{-2.0, 3.0}});
+  EXPECT_NEAR(split.loss_chg, 2.97619f * this->kSplitTargets, kRtEps * this->kSplitTargets);
+  EXPECT_FALSE(split.DefaultLeft());
+  EXPECT_TRUE(std::isnan(split.split_value));
+  this->CheckCategories({true, false, false, false});
+  for (bst_target_t t = 0; t < this->kSplitTargets; ++t) {
+    EXPECT_EQ(split.left_sum.at(t), GradientPairPrecise(2.5, 2.5));
+    EXPECT_EQ(split.right_sum.at(t), GradientPairPrecise(-1.5, 3.5));
+  }
+  this->CheckApply();
+
+  // Only the second target benefits from this partition, with missing values on the right.
+  this->cuts_ = MakeCutsForTest({0.0, 1.0, 2.0}, {0, 3}, DeviceOrd::CPU());
+  auto const &mixed = this->Evaluate(
+      {{{-3.0, 1.0}, {-3.0, 1.0}, {-3.0, 1.0}}, {{-3.0, 1.0}, {-3.0, 1.0}, {-2.0, 1.0}}},
+      {{-3.0, 1.0}, {-2.0, 1.0}});
+  EXPECT_FLOAT_EQ(mixed.loss_chg, this->kSplitTargets - 1);
+  if constexpr (TestFixture::kSplitTargets > 1) {
+    EXPECT_FALSE(mixed.DefaultLeft());
+    this->CheckCategories({false, false, true});
+    EXPECT_EQ(mixed.right_sum.at(0), GradientPairPrecise(-6.0, 2.0));
+    EXPECT_EQ(mixed.right_sum.at(1), GradientPairPrecise(-4.0, 2.0));
+    this->CheckApply();
+  }
+}
+
+TYPED_TEST(TestHistEvaluator, PartitionParentWeight) {
+  // Shift all category gradients to give the parent a positive, zero, or negative weight.
+  for (auto offset : {-2.0, 0.0, 2.0}) {
+    auto const &split =
+        this->Evaluate({{{1.0 + offset, 1.0}, {-2.0 + offset, 1.0}, {1.0 + offset, 1.0}}});
+    if (offset == 0.0 && this->kSplitTargets > 1) {
+      // With multiple targets the zero projection still preserves bin order.
+      EXPECT_FLOAT_EQ(split.loss_chg, 1.5f * this->kSplitTargets);
+      this->CheckCategories({true, false, false});
+    } else {
+      // Isolate category 1; the child orientation can differ.
+      EXPECT_FLOAT_EQ(split.loss_chg, 6.0f * this->kSplitTargets);
+      common::KCatBitField bits{split.cat_bits};
+      EXPECT_EQ(bits.Check(0), bits.Check(2));
+      EXPECT_NE(bits.Check(0), bits.Check(1));
+    }
+  }
+}
+
+TYPED_TEST(TestHistEvaluator, PartitionUnregularizedOrder) {
+  // -G/H sorts the categories as (1, 2, 0). Sorting by -G/(H + lambda) gives (2, 1, 0) and
+  // misses isolating category 1: 2^2/(3+2) + 5^2/(2+2) - 7^2/(5+2) = 0.05.
+  auto const &split =
+      this->Evaluate({{{-4.0, 1.0}, {-2.0, 3.0}, {-1.0, 1.0}}}, {}, {{"reg_lambda", "2"}});
+  EXPECT_NEAR(split.loss_chg, 0.05f * this->kSplitTargets, kRtEps);
+  this->CheckCategories({false, true, false});
+}
+}  // namespace xgboost::tree
